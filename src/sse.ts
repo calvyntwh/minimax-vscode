@@ -76,8 +76,9 @@ function processText(
     } else {
       const open = state.buf.indexOf('<think>');
       if (open === -1) {
-        visible += state.buf;
-        state.buf = '';
+        const tagPrefix = longestTagPrefixSuffix(state.buf, '<think>');
+        visible += state.buf.slice(0, state.buf.length - tagPrefix.length);
+        state.buf = tagPrefix;
         return { visible, thinking };
       }
       visible += state.buf.slice(0, open);
@@ -86,6 +87,14 @@ function processText(
     }
   }
   return { visible, thinking };
+}
+
+function longestTagPrefixSuffix(value: string, tag: string): string {
+  const maxLength = Math.min(value.length, tag.length - 1);
+  for (let length = maxLength; length > 0; length--) {
+    if (value.endsWith(tag.slice(0, length))) return tag.slice(0, length);
+  }
+  return '';
 }
 
 export async function consumeSseStream(
@@ -295,12 +304,35 @@ export function toApiMessages(
     const hasImage = msg.content.some(
       (p) => p instanceof vscode.LanguageModelDataPart,
     );
-    if (!text && !hasImage) continue;
     const role = roleToString(msg.role);
-    if (hasImage) {
+
+    const toolCalls = msg.content.filter(
+      (p): p is vscode.LanguageModelToolCallPart =>
+        p instanceof vscode.LanguageModelToolCallPart,
+    );
+    const toolResults = msg.content.filter(
+      (p): p is vscode.LanguageModelToolResultPart =>
+        p instanceof vscode.LanguageModelToolResultPart,
+    );
+
+    if (toolCalls.length) {
+      out.push({
+        role: 'assistant',
+        content: text || null,
+        tool_calls: toolCalls.map((part) => ({
+          id: part.callId,
+          type: 'function',
+          function: {
+            name: part.name,
+            arguments: JSON.stringify(part.input),
+          },
+        })),
+      });
+    } else if (hasImage) {
       const parts: Array<Record<string, unknown>> = [];
       for (const part of msg.content) {
         if (part instanceof vscode.LanguageModelTextPart) {
+          parts.push({ type: 'text', text: part.value });
         } else if (part instanceof vscode.LanguageModelDataPart) {
           // Detect mime from magic bytes. The LanguageModelDataPart.image()
           // helper is a static constructor that wraps raw bytes with a caller-
@@ -316,7 +348,18 @@ export function toApiMessages(
         }
       }
       out.push({ role, content: parts });
-    } else {
+    } else if (toolResults.length) {
+      for (const part of toolResults) {
+        const resultText = part.content
+          .filter(
+            (item): item is vscode.LanguageModelTextPart =>
+              item instanceof vscode.LanguageModelTextPart,
+          )
+          .map((item) => item.value)
+          .join('');
+        out.push({ role: 'tool', tool_call_id: part.callId, content: resultText });
+      }
+    } else if (text) {
       out.push({ role, content: text });
     }
   }
