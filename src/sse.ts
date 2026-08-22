@@ -19,6 +19,9 @@
 
 import * as vscode from 'vscode';
 
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
+const STREAM_MAX_DURATION_MS = 15 * 60_000;
+
 export interface StreamCallbacks {
   onText: (text: string) => void;
   onThinking: (text: string) => void;
@@ -99,10 +102,19 @@ export async function consumeSseStream(
   >();
   const textState = { buf: '', inThink: false };
   let thinkBuf = '';
+  const deadline = Date.now() + STREAM_MAX_DURATION_MS;
 
   try {
     while (!signal.aborted) {
-      const { value, done } = await reader.read();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error('MiniMax stream exceeded the maximum duration');
+      }
+      const { value, done } = await readWithTimeout(
+        reader,
+        Math.min(STREAM_IDLE_TIMEOUT_MS, remaining),
+        signal,
+      );
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -178,13 +190,49 @@ export async function consumeSseStream(
     flushPending(textState, thinkBuf, cb);
     cb.onDone('stop');
   } catch (err) {
-    cb.onError(err instanceof Error ? err : new Error(String(err)));
+    if (!signal.aborted) {
+      cb.onError(err instanceof Error ? err : new Error(String(err)));
+    }
   } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* noop */
+    }
     try {
       reader.releaseLock();
     } catch {
       /* noop */
     }
+  }
+}
+
+async function readWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<Awaited<ReturnType<typeof reader.read>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void reader.cancel();
+          reject(new Error('MiniMax stream timed out waiting for data'));
+        }, timeoutMs);
+        onAbort = () => {
+          void reader.cancel();
+          reject(new Error('MiniMax stream cancelled'));
+        };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -208,6 +256,30 @@ function roleToString(role: vscode.LanguageModelChatMessageRole): string {
     : 'user';
 }
 
+// Sniff the actual image format from the first bytes. Per MiniMax docs,
+// M3 supports JPEG / PNG / GIF / WEBP. We default to PNG when nothing
+// matches; the server will return its own decode error in that case.
+function detectImageMime(data: Uint8Array): string {
+  if (data.length >= 8 &&
+    data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+    return 'image/png';
+  }
+  if (data.length >= 3 &&
+    data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (data.length >= 6 &&
+    data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x38) {
+    return 'image/gif';
+  }
+  if (data.length >= 12 &&
+    data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 &&
+    data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) {
+    return 'image/webp';
+  }
+  return 'image/png';
+}
+
 export function toApiMessages(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
 ): Array<Record<string, unknown>> {
@@ -229,18 +301,13 @@ export function toApiMessages(
       const parts: Array<Record<string, unknown>> = [];
       for (const part of msg.content) {
         if (part instanceof vscode.LanguageModelTextPart) {
-          parts.push({ type: 'text', text: part.value });
         } else if (part instanceof vscode.LanguageModelDataPart) {
-          let mime = 'image/png';
-          try {
-            mime = vscode.LanguageModelDataPart.image(part.data, mime).mimeType;
-          } catch {
-            const probe = part as unknown as Record<string, unknown>;
-            if (typeof probe['mimeType'] === 'string') {
-              const v = probe['mimeType'];
-              if (v.length > 0) mime = v;
-            }
-          }
+          // Detect mime from magic bytes. The LanguageModelDataPart.image()
+          // helper is a static constructor that wraps raw bytes with a caller-
+          // provided mime; it does NOT throw on unknown formats. The probe
+          // fallback below is therefore unreliable. Inspect the first few
+          // bytes instead so the wire mime matches the actual encoding.
+          const mime = detectImageMime(part.data);
           const b64 = Buffer.from(part.data).toString('base64');
           parts.push({
             type: 'image_url',
