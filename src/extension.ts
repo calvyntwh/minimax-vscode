@@ -68,8 +68,8 @@ function buildBody(
   const body: Record<string, unknown> = {
     model: def.id,
     messages: apiMessages,
-    // Per docs: use max_completion_tokens for new integrations. Keep
-    // max_tokens as a fallback for older servers that reject the newer field.
+    // Per docs: max_completion_tokens is the canonical field for new
+    // integrations. MiniMax accepts this on all M-series.
     max_completion_tokens: maxTokens,
     temperature,
     top_p: topP,

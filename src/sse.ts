@@ -63,9 +63,10 @@ function processText(
     if (state.inThink) {
       const close = state.buf.indexOf('</think>');
       if (close === -1) {
-        // Give up cleanly if the model never closes the think block.
         if (state.buf.length > 200_000) {
-          visible += state.buf;
+          // Unclosed think block: route to thinking, not visible, so we
+          // don't leak the model's raw chain-of-thought into the answer.
+          thinking += state.buf + '\n[truncated]';
           state.buf = '';
         }
         return { visible, thinking };
