@@ -4,3 +4,4 @@ src/**
 .prettierrc.*
 .esbuild.mjs
 package-lock.json
+docs/**
