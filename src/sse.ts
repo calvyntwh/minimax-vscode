@@ -267,9 +267,10 @@ function roleToString(role: vscode.LanguageModelChatMessageRole): string {
 }
 
 // Sniff the actual image format from the first bytes. Per MiniMax docs,
-// M3 supports JPEG / PNG / GIF / WEBP. We default to PNG when nothing
-// matches; the server will return its own decode error in that case.
-function detectImageMime(data: Uint8Array): string {
+// M3 supports JPEG / PNG / GIF / WEBP. Returns null when the bytes
+// don't match any of those — caller decides what to do (use the host
+// mime as fallback, or surface an error).
+function detectImageMime(data: Uint8Array): string | null {
   if (data.length >= 8 &&
     data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
     return 'image/png';
@@ -287,7 +288,33 @@ function detectImageMime(data: Uint8Array): string {
     data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) {
     return 'image/webp';
   }
-  return 'image/png';
+  return null;
+}
+
+// Per platform.minimax.io the supported image formats for M3 are
+// JPEG / PNG / GIF / WEBP. Anything outside this set, even if the host
+// says it's supported, will be rejected by M3 with HTTP 400.
+const SUPPORTED_IMAGE_MIMES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+]);
+
+// Pick the best mime for an image. Per VS Code's LanguageModel API, the
+// host supplies a mime when constructing the data part, so we trust it
+// when (a) the host provided one, and (b) the value is in M3's
+// supported set. Otherwise fall back to byte-sniff. If the bytes also
+// don't match a known format, return null and the caller surfaces an
+// error to the user rather than shipping a labeled-but-bogus payload.
+function pickImageMime(
+  hostMime: string | undefined,
+  data: Uint8Array,
+): string | null {
+  if (hostMime && SUPPORTED_IMAGE_MIMES.has(hostMime)) {
+    return hostMime;
+  }
+  return detectImageMime(data);
 }
 
 export function toApiMessages(
@@ -335,12 +362,20 @@ export function toApiMessages(
         if (part instanceof vscode.LanguageModelTextPart) {
           parts.push({ type: 'text', text: part.value });
         } else if (part instanceof vscode.LanguageModelDataPart) {
-          // Detect mime from magic bytes. The LanguageModelDataPart.image()
-          // helper is a static constructor that wraps raw bytes with a caller-
-          // provided mime; it does NOT throw on unknown formats. The probe
-          // fallback below is therefore unreliable. Inspect the first few
-          // bytes instead so the wire mime matches the actual encoding.
-          const mime = detectImageMime(part.data);
+          // Honor the host's mime when it names a format M3 supports
+          // (per platform.minimax.io). Otherwise sniff the bytes; if the
+          // bytes are also unrecognizable, drop the image and surface a
+          // note to the user so a silently-missing image part doesn't
+          // become a confusing empty response.
+          const hostMime = part.mimeType || undefined;
+          const mime = pickImageMime(hostMime, part.data);
+          if (!mime) {
+            parts.push({
+              type: 'text',
+              text: `[minimax: image skipped — host mime "${hostMime ?? 'none'}" is not in M3's supported set (image/jpeg, image/png, image/gif, image/webp) and the bytes do not match any of those formats]`,
+            });
+            continue;
+          }
           const b64 = Buffer.from(part.data).toString('base64');
           parts.push({
             type: 'image_url',
